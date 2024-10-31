@@ -56,7 +56,66 @@ The protocol team fixed this issue in the following PRs/commits:
 https://github.com/morph-l2/morph/pull/562
 
 
-# Issue H-2: Sequencer will be underpaid because of incorrect `commitScalar` 
+# Issue H-2: Attacker can freeze chain and steal challenge deposits using fake `prevStateRoot` 
+
+Source: https://github.com/sherlock-audit/2024-08-morphl2-judging/issues/84 
+
+## Found by 
+PapaPitufo
+### Summary
+
+Because the `prevStateRoot` is not validated until a batch is finalized, a committed batch with a malicious `prevStateRoot` can be used to both (a) win challenges against honest challengers and (b) halt the chain since it will be approved but be unable to be finalized.
+
+### Root Cause
+
+In `Rollup.sol`, if a malicious batch is proposed, the assumption is that the sequencer who proposed it will lose the challenge, get slashed, and the chain will be reset. These economic incentives prevent the chain from being regularly halted.
+
+This is based on the assumption that a sequencer can only win challenges if the batch they proposed is valid.
+
+However, the check that `prevStateRoot` is actually the `postStateRoot` of the previous batch only happens in `finalizeBatch()`. This check is sufficient to prevent batches with fake `prevStateRoot`s from being finalized, but it does not stop these batches from being committed.
+
+This allows a malicious sequencer to propose any batch that performs a valid state transaction on a fake `prevStateRoot`.
+
+In most cases, a challenger will attack this invalid batch. However, it is possible for the sequencer to provide a valid proof of this state transition to steal the honest challenger's deposit and win the challenge.
+
+In the case that this happens, or that no challenge is performed, the committed batch will not be able to finalized due to [the following check](https://github.com/sherlock-audit/2024-08-morphl2/blob/main/morph/contracts/contracts/l1/rollup/Rollup.sol#L507-L509):
+```solidity
+require(
+    finalizedStateRoots[_batchIndex - 1] == BatchHeaderCodecV0.getPrevStateHash(memPtr),
+    "incorrect previous state root"
+);
+```
+This will freeze the chain and not allow any new batches to be finalized, since batches are committed sequentially and must be finalized sequentially.
+
+### Internal Preconditions
+
+None
+
+### External Preconditions
+
+None
+
+### Attack Path
+
+1. Attacker proposes a batch that contains a valid state transition from a fake `prevStateRoot`.
+2. If an honest challenger challenges the batch, the attacker provides a valid proof of the state transition to win the challenge and steal the challenger's deposit.
+3. Whether or not the above happens, the chain is now halted, as the attacker's batch cannot be finalized, and no other batches can be finalized without it being finalized first.
+4. The attacker will not be slashed, due to the fact that they won the challenge.
+
+### Impact
+
+- An honest challenge will lose their deposit when a dishonest sequencer beats them in a challenge.
+- No new batches will be able to be finalized, so the chain will halt and have to be manually rolled back by the admins.
+
+### PoC
+
+N/A
+
+### Mitigation
+
+Check in `commitBatch()` that `prevStateRoot` is equal to the `parentBatchHeader.postStateRoot`.
+
+# Issue H-3: Sequencer will be underpaid because of incorrect `commitScalar` 
 
 Source: https://github.com/sherlock-audit/2024-08-morphl2-judging/issues/90 
 
@@ -137,464 +196,6 @@ N/A
 `commitBatch()` should be set to `230_000e9`.
 
 Note that it appears that this value was pulled from Scroll's current on chain implementation. This issue has been reported directly to Scroll as well, and has been deemed valid and awarded with a bounty via their Immunefi bounty program.
-
-# Issue H-3: Malicious users can make failed messages unreplayable by exhausting `maxReplayTimes`, leading to funds stuck forever on the origin chain 
-
-Source: https://github.com/sherlock-audit/2024-08-morphl2-judging/issues/177 
-
-## Found by 
-underdog
-### Summary
-
-The limitation of only allowing messages to be replayed up to `maxReplayTimes`, together with a conservative computation of the required gas limit to execute a message allows malicious users to prevent messages from being replayed. A malicious user can trigger `replayMessage` up to `maxReplayTimes` with a low gas limit, forcing the transaction to fail on the destination (Morph) chain, and making sender funds remain stuck forever in the L1.
-
-### Root Cause
-
-This bug requires some context prior to directly diving into the Root cause.
-
-#### Introduction
-
-Morph's `L1CrossDomainMessenger` acts as Morph’s entry point to transfer cross-layer messages. In order to send a message from L1->L2, the `sendMessage()` function is used, and the transaction executed will be internally tracked by encoding the following parameters into a unique identifier (the `xDomainCalldataHash`):
-
-- `relayMessage()` method signature
-- Sender of the transaction
-- Receiver on the destination chain
-- Value
-- Nonce from the Message Queue
-- The actual message
-
-The encoding is done with the `_encodeXDomainCalldata()` internal function, which gives an encoded array of bytes that will later be hashed. This allows to track each specific message with a unique identifier:
-
-```solidity
-// File: L1CrossDomainMessenger.sol
-
-function _sendMessage(
-        address _to,
-        uint256 _value,
-        bytes memory _message,
-        uint256 _gasLimit,
-        address _refundAddress 
-    ) internal nonReentrant {
-        ...
-        bytes memory _xDomainCalldata = _encodeXDomainCalldata(_msgSender(), _to, _value, _messageNonce, _message);
-
-        ...
-
-        // record the message hash for future use.
-        bytes32 _xDomainCalldataHash = keccak256(_xDomainCalldata);
-
-        // normally this won't happen, since each message has different nonce, but just in case.
-        require(messageSendTimestamp[_xDomainCalldataHash] == 0, "Duplicated message");
-        messageSendTimestamp[_xDomainCalldataHash] = block.timestamp;
-        ...
-
-    }
-
-```
-
-It is worth noting that `_gasLimit` is **NOT** encoded neither used to obtain the final `_xDomainCalldataHash`. This is done because sometimes the gas limit specified to send a cross-layer transaction might not be enough to correctly execute the transaction on the L2. If this occurs, Morph allows users to retrigger the transaction via the `replayMessage()` function.
-
-#### Replaying messages
-
-As mentioned in the introduction, cross-layer messages that failed on the destination chain can be replayed via the `replayMessage()` function:
-
-```solidity
-// File: L1CrossDomainMessenger.sol
-
-function replayMessage( 
-        address _from,
-        address _to, 
-        uint256 _value, 
-        uint256 _messageNonce,  
-        bytes memory _message,
-        uint32 _newGasLimit,
-        address _refundAddress
-    ) external payable override whenNotPaused notInExecution { 
-        ...
-        
-        bytes memory _xDomainCalldata = _encodeXDomainCalldata(_from, _to, _value, _messageNonce, _message);
-        bytes32 _xDomainCalldataHash = keccak256(_xDomainCalldata);
-
-        ...
-
-        ReplayState memory _replayState = replayStates[_xDomainCalldataHash];
-        // update the replayed message chain.
-        unchecked {
-            if (_replayState.lastIndex == 0) {
-                // the message has not been replayed before.
-                prevReplayIndex[_nextQueueIndex] = _messageNonce + 1;
-            } else {
-                prevReplayIndex[_nextQueueIndex] = _replayState.lastIndex + 1;
-            }
-        }
-        _replayState.lastIndex = uint128(_nextQueueIndex);
-
-        // update replay times
-        require(_replayState.times < maxReplayTimes, "Exceed maximum replay times");
-        unchecked {
-            _replayState.times += 1;
-        }
-        replayStates[_xDomainCalldataHash] = _replayState;
-
-        ...
-
-    }
-
-```
-
-This functionality allows users that have had their cross-layer transactions failed on the L2 (maybe due to setting an incorrect gas limit) to be replayed with a greater gas limit.
-
-There are two points worth mentioning from this function:
-
-- `replayMessage()` allows to pass a `_newGasLimit` parameter. As mentioned before, the gas limit is not used to obtain the unique identifier `_xDomainCalldataHash`, so this allows users that have had their message fail on the L2 due to setting a low gas limit on `sendMessage()` to retrigger it with a different gas limit. It is also worth noting that the gas limit **is not required to be greater than the gas limit set in the original call**.
-- There is a maximum number of times that a message can be replayed. This is done because Morph also allows messages to be dropped when the cross-layer transaction leads to a circuit overflow (this is described in the [Handling Cross-layer (Bridge) Failures section](https://docs.morphl2.io/docs/how-morph-works/general-protocol-design/communicate-between-morph-and-ethereum#handling-cross-layer-bridge-failures). `maxReplayTimes` limits the amount of times a message can be replayed, because the logic to drop a message iterates a list that contains all the replayed messages and drops all of them. If there was not a limit on the amount of replayed messages, then the message dropping logic could be DoS'ed by a malicious user by inflating the amount of replayed messages:
-    
-    ```solidity
-    // File: L1CrossDomainMessenger.sol
-    
-        function dropMessage( 
-            address _from,
-            address _to,
-            uint256 _value,
-            uint256 _messageNonce,
-            bytes memory _message
-        ) external override whenNotPaused notInExecution {
-            // The criteria for dropping a message: 
-            // 1. The message is a L1 message.
-            // 2. The message has not been dropped before.
-            // 3. the message and all of its replacement are finalized in L1.
-            // 4. the message and all of its replacement are skipped.
-            //
-            // Possible denial of service attack:
-            // + replayMessage is called every time someone want to drop the message.
-            // + replayMessage is called so many times for a skipped message, thus results a long list.
-            //
-            // We limit the number of `replayMessage` calls of each message, which may solve the above problem.
-    
-            
-    
-            ...
-    
-          
-     
-            // check message is skipped and drop it.
-            // @note If the list is very long, the message may never be dropped.
-            while (true) {
-                IL1MessageQueue(_messageQueue).dropCrossDomainMessage(_lastIndex);
-                _lastIndex = prevReplayIndex[_lastIndex]; 
-                if (_lastIndex == 0) break;
-                unchecked {
-                    _lastIndex = _lastIndex - 1;
-                }
-            }
-     
-            isL1MessageDropped[_xDomainCalldataHash] = true;
-    
-            // set execution context
-            xDomainMessageSender = Constants.DROP_XDOMAIN_MESSAGE_SENDER;
-            IMessageDropCallback(_from).onDropMessage{value: _value}(_message);
-            // clear execution context
-            xDomainMessageSender = Constants.DEFAULT_XDOMAIN_MESSAGE_SENDER;
-        }
-    
-    ```
-    
-
-#### Gas limit estimations
-
-Every time a message is sent via the CrossDomainMessenger contract, a gas estimation is performed in order to verify wether the gas limit specified by the user is actually enough to properly execute the transaction on the destination chain. This is done inside the message queue's `appendCrossDomainMessage()` function, using the `_validateGasLimit()` internal function. The gas limit validation will be carried out via the following process:
-
-1. Every time a message is sent, the queue's `appendCrossDomainMessage()` method is called to actually send the message:
-
-```solidity
-// File: L1CrossDomainMessenger.sol
-
-function _sendMessage(
-        address _to,
-        uint256 _value,
-        bytes memory _message,
-        uint256 _gasLimit,
-        address _refundAddress 
-    ) internal nonReentrant {
-        ...
-
-        // append message to L1MessageQueue
-        IL1MessageQueue(_messageQueue).appendCrossDomainMessage(_counterpart, _gasLimit, _xDomainCalldata);
-
-        ...
-
-    }
-
-```
-
-1. `appendCrossDomainMessage()` will call the `_validateGasLimit()` function, passing the gas limit specified by the user, together with the total `data` that must be sent to the destination. Among other checks, `_validateGasLimit()` will call the `calculateIntrinsicGasFee()` function, and a check will be performed to ensure that the gas limit passed by the user is equal or greater than the computed `intrinsicGas`:
-
-```solidity
-// File: L1MessageQueueWithGasPriceOracle.sol
-
-function appendCrossDomainMessage(
-        address _target,
-        uint256 _gasLimit,
-        bytes calldata _data
-    ) external override onlyMessenger {
-        // validate gas limit
-        _validateGasLimit(_gasLimit, _data); 
-   
-        // do address alias to avoid replay attack in L2.
-        address _sender = AddressAliasHelper.applyL1ToL2Alias(_msgSender());
-   
-        _queueTransaction(_sender, _target, 0, _gasLimit, _data); 
-    }
-
-    function _validateGasLimit(uint256 _gasLimit, bytes calldata _calldata) internal view {
-        require(_gasLimit <= maxGasLimit, "Gas limit must not exceed maxGasLimit");
-        // check if the gas limit is above intrinsic gas
-        uint256 intrinsicGas = calculateIntrinsicGasFee(_calldata);
-        require(_gasLimit >= intrinsicGas, "Insufficient gas limit, must be above intrinsic gas");
-    }
-```
-
-1. `calculateIntrinsicGasFee()` will finally perform the estimation of the gas limit in order to deliver the message:
-
-```solidity
-// L1MessageQueueWithGasPriceOracle.sol
-
-function calculateIntrinsicGasFee(bytes calldata _calldata) public pure virtual returns (uint256) { 
-        // no way this can overflow `uint256`
-        unchecked {
-            return INTRINSIC_GAS_TX + _calldata.length * APPROPRIATE_INTRINSIC_GAS_PER_BYTE; 
-        }
-    }
-
-```
-
-As a summary, `calculateIntrinsicGasFee()` calculates the required gas limit by multiplying the total calldata length to be sent by the cost of sending each byte in the calldata (`APPROPRIATE_INTRINSIC_GAS_PER_BYTE`, which is hardcoded to 16, corresponding to the actual cost of a byte of calldata in Ethereum). Additionally,  the intrinsic gas cost of 21,000 units of gas to send a transaction in Ethereum is also added to the computation (as `INTRINSIC_GAS_TX`). 
-
-The main concept to be aware of in this computation is that **the calculation only takes into account the cost of paying for the calldata, plus the 21,000 intrinsic gas cost for the external gas call**. This means that the actual amount of gas that will be consumed by the call on the destination chain is **NOT** accounted for when veryfing the gas limit. As a TLDR, this computation only ensures that the cost of sending a transaction plus delivering the calldata is enough, but it does not account for the actual cost that the transaction will consume when being executed (i.e, the cost of the opcodes and the logic executed inside the transaction).
-
-#### The actual bug and root cause
-
-The bug reported in this issue focuses on two main points in the implementation:
-
-- **Limit on the amount of times a failed transaction can be replayed**: Because transactions can only be replayed up to `maxReplayTimes`, and the `replayMessage()` function is permissionless, a malicious user can trigger `replayMessage()` several times for any user's failed transactions, exhausting the amount of times the transaction can be replayed. Note that the user will not be able to drop the message unless it has failed due to being dropped on the destination (which will only occur for a specific subset of messages that have triggered a ciruit overflow).
-- **Conservative estimation of gas limit**: Because the gas limit computation performed in `calculateIntrinsicGasFee()` is too conservative, it is possible for the attacker to replay the messages setting a gas limit that **is guaranteed to always make the message fail on the destination chain**. This is because, as shown before, `calculateIntrinsicGasFee()` only takes into account the cost of paying for the calldata.
-
-The attack path section details how this can be leveraged to force user's funds to be stuck forever in the contract, as well as to completely DoS of the `replayMessage()` functionality in Morph.
-
-### Internal pre-conditions
-
-1. A user has sent a cross-layer transaction from the L1→L2.
-2. The user has set an insufficient gas limit value, and the transaction on the L2 has failed due to an out of gas error.
-
-### External pre-conditions
-
-None.
-
-### Attack Path
-
-Because of this, the following scenario can take place:
-
-1. A user wants to bridge some ETH from Ethereum to Morph. He calls the `depositETH()` function in the `L1ETHGateway` and 10 ETH are deposited into the protocol. `depositETH()` will then interact with the `L1CrossDomainMessenger` to send the L1->L2 cross-layer message. In this initial call (and due to the conservative gas estimations), the user sets a gas limit that is not enough to execute the message on the L2, so the message fails on the destination (note that this is a completely acceptable scenario, and as per the current implementation of Morph users should be able to replay their failed messages if situations like this occur).
-2. A malicious user sees the failed transaction and calls `replayMessage()` up to `maxReplayTimes`. He sets the minimum possible gas limit in each replay call so that the function is guaranteed to fail on Morph (note that the gas limit is not required to be greater than the gas limit set in the original transaction, but only greater or equal to the gas cost estimated by `calculateIntrinsicGasFee()`). The transaction is guaranteed to fail on Morph due to the fact that, as mentioned in previous sections, the gas cost estimations are extremely conservative, and don’t account for the logic that will take place on the destination chain (they only account for the intrinsic gas costs + the cost of calldata).
-3. As a result, the initial user can no longer replay the message because it has already been replayed up to `maxReplayTimes` by the malicious user. The replays have been guaranteed to fail due to the conservative nature of the current gas cost estimations, and the user can’t get the funds back by dropping the message because the `dropMessage()` functionality is only allowed for messages that are skipped (i.e messages that cause a circuit overflow), which is not the case as messages failing in the L2 due to a low gas limit are not skipped, and are actually considered valid transactions.
-
-### Impact
-
-As shown, the excessively conservative gas estimation in the gas limit computation, together with the limitation in the number of times a transaction can be replayed leads to two critical scenarios:
-
-- The replay message functionality in the protocol can be effectively DoS'ed, as messages can always be replayed by anyone with a gas limit that is guaranteed to fail on the destination chain. This can lead to funds stuck on the L1. The amount will depend on each user’s transaction, but might vary from low amounts to huge amounts.
-- User's funds that have already been transferred in a transaction that fails due to gas limit can be effectively locked forever in the contract, given that the replay functionality can be DoS'ed.
-
-### PoC
-
-_No response_
-
-### Mitigation
-
-For this scenario, it is recommended to always ensure that the caller of either the `replayMessage()` or `dropMessage()` functions is the actual `_from` address specified. If it is expected for Morph to also sometimes be able to replay or drop messages on behalf of users, an additional functionality that could be added to expand the flexibility of the functions would be to add an approvals mapping, so that users can approve who can replay/drop their messages.
-
-In addition, I highly encourage the Morph team to explore how other cross-chain protocols apply mitigations to the core issues mentioned in this report.
-
-- Optimism fixes the conservative gas limit estimation by adding extra values in the computation of the gas limit.
-    - In their [`CrossDomainMessenger`'s `sendMessage()` function](https://github.com/ethereum-optimism/optimism/blob/d48b45954c381f75a13e61312da68d84e9b41418/packages/contracts-bedrock/src/universal/CrossDomainMessenger.sol#L176), gas limit is not only passed as the `_minGasLimit` parameter specified by the user, but an additional [baseGas](https://github.com/ethereum-optimism/optimism/blob/d48b45954c381f75a13e61312da68d84e9b41418/packages/contracts-bedrock/src/universal/CrossDomainMessenger.sol#L183) function is called in order to [account for additional gas that might be consumed on the destination chain](https://github.com/ethereum-optimism/optimism/blob/d48b45954c381f75a13e61312da68d84e9b41418/packages/contracts-bedrock/src/universal/CrossDomainMessenger.sol#L342-L359).
-
-```solidity
-// File: CrossDomainMessenger.sol (<https://github.com/ethereum-optimism/optimism/blob/d48b45954c381f75a13e61312da68d84e9b41418/packages/contracts-bedrock/src/universal/CrossDomainMessenger.sol#L342-L359>)
-function baseGas(bytes calldata _message, uint32 _minGasLimit) public pure returns (uint64) {
-        return
-        // Constant overhead
-        RELAY_CONSTANT_OVERHEAD
-        // Calldata overhead
-        + (uint64(_message.length) * MIN_GAS_CALLDATA_OVERHEAD)
-        // Dynamic overhead (EIP-150)
-        + ((_minGasLimit * MIN_GAS_DYNAMIC_OVERHEAD_NUMERATOR) / MIN_GAS_DYNAMIC_OVERHEAD_DENOMINATOR)
-        // Gas reserved for the worst-case cost of 3/5 of the `CALL` opcode's dynamic gas
-        // factors. (Conservative)
-        + RELAY_CALL_OVERHEAD
-        // Relay reserved gas (to ensure execution of `relayMessage` completes after the
-        // subcontext finishes executing) (Conservative)
-        + RELAY_RESERVED_GAS
-        // Gas reserved for the execution between the `hasMinGas` check and the `CALL`
-        // opcode. (Conservative)
-        + RELAY_GAS_CHECK_BUFFER;
-    }
-
-```
-
-- In Chainlink's CCIP, the gas limit specified by users when a transaction is replayed **[can't be smaller than the limit specified in the original cross-chain message](https://github.com/smartcontractkit/ccip/blob/ccip-develop/contracts/src/v0.8/ccip/offRamp/EVM2EVMOffRamp.sol#L246-L250)**. This prevents the issue where messages replayed can be set the same gas limit that made the original transaction to fail:
-
-```solidity
-// File: EVM2EVMOffRamp.sol (<https://github.com/smartcontractkit/ccip/blob/ccip-develop/contracts/src/v0.8/ccip/offRamp/EVM2EVMOffRamp.sol#L246-L250>)
-
-function manuallyExecute(
-    Internal.ExecutionReport memory report,
-    GasLimitOverride[] memory gasLimitOverrides
-  ) external {
-    // We do this here because the other _execute path is already covered OCR2BaseXXX.
-    ...
-      // Checks to ensure message cannot be executed with less gas than specified.
-      if (newLimit != 0) {
-        if (newLimit < message.gasLimit) {
-          revert InvalidManualExecutionGasLimit(message.messageId, message.gasLimit, newLimit);
-        }
-      }
-
-}
-
-```
-
-In addition, neither Optimism nor CCIP limit the amount of times a message can be replayed. This prevents the bug described in this report from taking place.
-
-# Issue H-4: `proveState()` can be frontrun, enabling malicious actors to steal sequencer's proof submission rewards 
-
-Source: https://github.com/sherlock-audit/2024-08-morphl2-judging/issues/185 
-
-## Found by 
-PapaPitufo, Stiglitz, jasonxiale, sammy, underdog
-### Summary
-
-Because `proveState()` is permissionless, malicious actors can frontrun sequencers proving the correctness of a batch in order to steal the `challengeDeposit()`.
-
-### Root Cause
-
-Found in [Rollup.sol#L465](https://github.com/sherlock-audit/2024-08-morphl2/blob/main/morph/contracts/contracts/l1/rollup/Rollup.sol#L465).
-
-Morph incorporates a novel state verification process called Responsive Validity Proof (RVP). In this process, sequencers submit batches to the L1’s rollup contract. If a submitted batch is found to be incorrect, challengers can trigger `challengeState()` in order to start a challenge period, in which it is the sequencer’s responsibility to prove the correctness of the batch by submitting a ZK proof via the `proveState()` function in `Rollup.sol`.
-
-As detailed in the [RVP is Friendly to Challengers section](https://docs.morphl2.io/docs/how-morph-works/optimistic-zkevm#rvp-is-friendly-to-challengers) the novel RVP process opens a potential attack vector. Quoting Morph’s documentation: 
-
-- *“While there is a risk of challengers initiating unnecessary challenges to increase costs for sequencers, RVP mitigates this by requiring challengers to compensate sequencers for the costs incurred if a challenge is unsuccessful.”*
-- *“This mechanism discourages frivolous challenges and ensures that only legitimate disputes are raised.”*
-
-Essentially, when a batch is challenged, generating a proof to prove the correctness of the batch will incur computational costs that need to be handled by the sequencer that submitted the batch. Malicious challengers could then always challenge batches (even if they’re correct) to force sequencers to waste money and resources to generate the proof. In order to mitigate this, challengers are required to deposit a minimum `challengeDeposit()` when initiating a challenge:
-
-```solidity
-// File: Rollup.sol
-
-function challengeState(uint64 batchIndex) external payable onlyChallenger nonReqRevert whenNotPaused { 
-        ...
-        // check challenge amount
-        require(msg.value >= IL1Staking(l1StakingContract).challengeDeposit(), "insufficient value");
-
-        ...
-    }
-```
-
-Then, if the `proveState()` function is triggered with a valid proof proving the correctness of the batch, the defender will win and the `challengeDeposit()` will be
-
-```solidity
-// File: Rollup.sol
-function proveState(
-        bytes calldata _batchHeader,
-        bytes calldata _aggrProof,
-        bytes calldata _kzgDataProof
-    ) external nonReqRevert whenNotPaused {
-        ...
-
-        // Check for timeout 
-        if (challenges[_batchIndex].startTime + proofWindow <= block.timestamp) { 
-            ...
-        } else {
-            _verifyProof(memPtr, _aggrProof, _kzgDataProof); 
-            // Record defender win
-            _defenderWin(_batchIndex, _msgSender(), "Proof success");
-        }
-    }
-    
-    function _defenderWin(uint256 batchIndex, address prover, string memory _type) internal {
-        uint256 challengeDeposit = challenges[batchIndex].challengeDeposit;
-        batchChallengeReward[prover] += challengeDeposit;
-        emit ChallengeRes(batchIndex, prover, _type);
-    }
-```
-
-It is important to note how the call to `_defenderWin()` passes `_msgSender()` as the `prover`, which is the address that will obtain the `challengeDeposit`.
-
-As shown in the code snippet, there is no access control in `proveState()`, so it is possible for a malicious actor to frontrun sequencers that want to prove the correctness of a batch (and which have wasted money and resources to generate such proof) in order to obtain the `challengeDeposit`. It is then possible for anyone to steal challenge deposits every time a batch is proven to be correct, leading to a loss of funds for the sequencer that has generated the proof.
-
-### Internal pre-conditions
-
-1. A batch is challenged. The batch is correct.
-2. The sequencer that submitted the batch has generated the proof that proves the correctness of the batch, and has triggered a call to `proveState()` to submit the proof.
-
-### External pre-conditions
-
-None.
-
-### Attack Path
-
-1. A sequencer submits a batch via `commitBatch()`.
-2. A challenger then challenges the batch by calling `challengeState()`, and deposits the minimum `challengeDeposit`.
-3. The sequencer generates the proof for the batch. When generated, it calls `proveState()`.
-4. A malicious actor is monitoring calls to `proveState()`, and frontruns the sequencer. He calls `proveState()` with the exact same parameters triggered by the sequencer.
-5. Due to the lack of access control in `proveState()`, the malicious’ actor call is first executed. The parameters (`_batchHeader`, `_aggrProof` and `_kzgDataProof`) are correct and prove the batch’s correctness, so a call to `_defenderWin()` is triggered, passing the address of the malicious actor as the `prover`.
-6. The malicious actor obtains the challenge deposit, effectively stealing it from the sequencer.
-
-Note that this bug also essentially enables malicious challengers to always challenge batches at no cost. If the malicious challengers act as the malicious actor frontrunning the call to `proveState()`, it is basically free (excluding gas costs) for malicious challengers to always challenge batches, affecting the proper functioning of Morph, given that data availability can be effectively delayed, and bypassing the expected behavior of the system for the vulnerability described in [Morph documentation](https://docs.morphl2.io/docs/how-morph-works/optimistic-zkevm#rvp-is-friendly-to-challengers).
-
-### Impact
-
-The sequencers can always lose the `challengeDeposit()` entitled to them in order to compensate them for the costs of generating the zero knowledge proof to prove the correctness of the batch. Moreover, there is essentially no cost for challengers to challenge correct batches and affect the proper behavior of the network.
-
-### PoC
-
-_No response_
-
-### Mitigation
-
-In order to mitigate this issue, ensure that proofs can only be submitted by the sequencer that submitted the batch. For this, the sequencer should be stored when committing a batch, given that as per the documentation the expected design of the system wants to reward the sequencer generating the proof. Another possible option is to allow any active sequencer to submit the proof, if any sequencer is expected to prove the correctness of batches:
-
-```diff
-// File: Rollup.sol
-
-function proveState(
-        bytes calldata _batchHeader,
-        bytes calldata _aggrProof,
-        bytes calldata _kzgDataProof
-    ) external nonReqRevert whenNotPaused {
-        ...
-
-        // Check for timeout 
-        if (challenges[_batchIndex].startTime + proofWindow <= block.timestamp) { 
-            ...
-        } else {
-+          require(IL1Staking(l1StakingContract).isActiveStaker(_msgSender()), "only active staker allowed");
-            _verifyProof(memPtr, _aggrProof, _kzgDataProof); 
-            // Record defender win
-            _defenderWin(_batchIndex, _msgSender(), "Proof success");
-        }
-    }
-```
-
-
-
-## Discussion
-
-**sherlock-admin2**
-
-The protocol team fixed this issue in the following PRs/commits:
-https://github.com/morph-l2/morph/pull/563
-
 
 # Issue M-1: `Rollup.sol` cannot split batches across blobs, allowing inexpensive block stuffing 
 
@@ -1015,7 +616,64 @@ The protocol team fixed this issue in the following PRs/commits:
 https://github.com/morph-l2/morph/pull/577
 
 
-# Issue M-5: A batch can be unintentionally be challenged during L1 reorg leading to loss of funds 
+# Issue M-5: Malicious challenger can brick `finalizeTimestamp` of unfinalized batches 
+
+Source: https://github.com/sherlock-audit/2024-08-morphl2-judging/issues/145 
+
+## Found by 
+DeltaXV, PASCAL, n4nika, ulas
+## Summary
+A malicious challenger can brick the delay for the finalization of batches. This is possible due to the uncapped extension of the finalization period for all unfinalized batches within the `challengeState` function.
+## Vulnerability Detail
+The `challengeState` function extends the `finalizeTimestamp` by doing an addition with the `proofWindow` variable (2 days) for each index (all unfinalized batches) except the challenged one, with not a single check or safeguard:
+```solidity 
+        for (uint256 i = lastFinalizedBatchIndex + 1; i <= lastCommittedBatchIndex; i++) {
+            if (i != batchIndex) {
+                batchDataStore[i].finalizeTimestamp += proofWindow;
+            }
+        }
+```
+The permissionless `proveState` function allows anyone including challengers to provide a ZK-proof and immediate resolution of a challenge, setting inChallenge to false:
+```solidity 
+        // Mark challenge as finished
+        challenges[_batchIndex].finished = true;
+        inChallenge = false;
+```
+Attack details: 
+- An attack window of 15 minutes (could be longer)
+     - 15 minutes = ~ 75 Ethereum blocks (12 seconds per block)
+     - Challenge-prove cycle (due to `inChallenge` flag) => 2 blocks per cycle => 37 batches
+     - Each cycle extends the finalization period for all other batches by `proofWindow` = 2 days (37 cycles * 2 days per cycle) means that each batch would inccur an additional extension of ~74 days! 
+- Attackers capital: 37 ETH => while risking only 1 ETH! 
+     - Or maybe not, because the malicious challenger could get his deposit back whenever admin pauses the contract [see Rollup::L444](https://github.com/sherlock-audit/2024-08-morphl2/blob/98e0ec4c5bbd0b28f3d3a9e9159d1184bc45b38d/morph/contracts/contracts/l1/rollup/Rollup.sol#L448)   
+     - `claimReward` function doesn't have a `whenNotPaused` modifier meaning that the owner has no ability to freeze attackers funds [see Rollup::L543](https://github.com/sherlock-audit/2024-08-morphl2/blob/98e0ec4c5bbd0b28f3d3a9e9159d1184bc45b38d/morph/contracts/contracts/l1/rollup/Rollup.sol#L543)
+
+**This combination allows an attacker to:**
+1. Pre-generate ZK proofs for multiple batches (32 unfinalized batch)
+2. Call `challengeState` function - Initiate a challenge on a batch 
+3. Call `proveState` function - Immediately prove the batch in the next block
+- Repeat steps 2-3 for multiple batches (32 times)
+
+Result: Each cycle extends the finalization period for all other batches by proofWindow (2 days), `finalizeTimestamp` accumulate a significant delay due to repetitive extension.
+## Impact
+- Massive delay for unfinalized batches (uncapped delay)
+       - Huge impact on L2
+       - Short-term: loss of time and money
+## Code Snippet
+https://github.com/sherlock-audit/2024-08-morphl2/blob/98e0ec4c5bbd0b28f3d3a9e9159d1184bc45b38d/morph/contracts/contracts/l1/rollup/Rollup.sol#L383
+## Tool used
+Manual Review
+## Recommendation
+Fix the current design by implementing some of these mitigation (mainly safguards):
+-  Implement a cooldown period between challenges for the same challenger address
+- Cap the maximum extension of the finalization period
+- Check which unfinalized batches requires a extension within the loop
+- Break this attack incentive ?
+        - Implement withdrawal lock period for withrawal request to monitor any suspicious activity
+        - Add a `whenNotPaused` modifier on the `claimReward` function, incase of exploit could freeze funds 
+- Ultimately restrict the "prover" actor (mitigation from sponsor discussed in private thread).
+
+# Issue M-6: A batch can be unintentionally be challenged during L1 reorg leading to loss of funds 
 
 Source: https://github.com/sherlock-audit/2024-08-morphl2-judging/issues/146 
 
@@ -1137,7 +795,6 @@ In the `challengeState` function, allow loading the `batchHeader` and verifying 
 
 
 
-
 ## Discussion
 
 **sherlock-admin2**
@@ -1146,7 +803,7 @@ The protocol team fixed this issue in the following PRs/commits:
 https://github.com/morph-l2/morph/pull/558
 
 
-# Issue M-6: Delegators can lose their rewards when a delegator has removed a delegatee and claims all of his rewards before delegating again to a previous removed delegatee. 
+# Issue M-7: Delegators can lose their rewards when a delegator has removed a delegatee and claims all of his rewards before delegating again to a previous removed delegatee. 
 
 Source: https://github.com/sherlock-audit/2024-08-morphl2-judging/issues/157 
 
@@ -1579,7 +1236,17 @@ function notifyDelegation(
 }
 ```
 
-# Issue M-7: Stakers lose their commission if they unstake as they cannot claim their pending rewards anymore after unstaking 
+
+
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/morph-l2/morph/pull/594
+
+
+# Issue M-8: Stakers lose their commission if they unstake as they cannot claim their pending rewards anymore after unstaking 
 
 Source: https://github.com/sherlock-audit/2024-08-morphl2-judging/issues/168 
 
@@ -1629,7 +1296,6 @@ Consider removing the `onlyStaker` modifier and allow anyone to call it. This sh
 
 
 
-
 ## Discussion
 
 **sherlock-admin2**
@@ -1638,9 +1304,11 @@ The protocol team fixed this issue in the following PRs/commits:
 https://github.com/morph-l2/morph/pull/516
 
 
-# Issue M-8: Attacker can fill merkle tree in `L2ToL1MessagePasser`, blocking any future withdrawals 
+# Issue M-9: Attacker can fill merkle tree in `L2ToL1MessagePasser`, blocking any future withdrawals 
 
 Source: https://github.com/sherlock-audit/2024-08-morphl2-judging/issues/178 
+
+The protocol has acknowledged this issue.
 
 ## Found by 
 mstpr-brainbot, n4nika
@@ -1707,8 +1375,104 @@ The forge output will show it costing about `9_924_957 gas` with which the calcu
 
 Consider adding different handling for when a merkle tree is full, not bricking the rollup because of a filled merkle tree.
 
+# Issue M-10: Malicious sequencer can DoS proposal execution by inflating the amount of proposals to be pruned 
 
-# Issue M-9: In the `revertBatch` function, `inChallenge` is set to `false` incorrectly, causing challenges to continue after the protocol is paused. 
+Source: https://github.com/sherlock-audit/2024-08-morphl2-judging/issues/186 
+
+## Found by 
+HaxSecurity, underdog
+### Summary
+
+A malicious sequencer can inflate the amount of proposals in `Gov.sol` in order to force the previous proposals invalidation process in `_executeProposal()` to run out of gas, making it impossible to execute proposals.
+
+### Root Cause
+
+Found in [Gov.sol#L257-L260](https://github.com/sherlock-audit/2024-08-morphl2/blob/main/morph/contracts/contracts/l2/staking/Gov.sol#L257-L260).
+
+The `Gov.sol` contract incorporates a “proposal pruning process”. Every time a proposal is executed, all the previous proposals since `undeletedProposalStart` will be pruned (even if they are executed or not). This is done in order to avoid a situation where older proposals get executed, overriding the governance values of newly executed proposals.
+
+As shown in the following code snippet, the “pruning process” works by iterating all proposals since the latest `undeletedProposalStart`, and until the current proposal ID. It is also worth noting that `undeletedProposalStart` is only updated **when executing a proposal,** and is set to the ID of the proposal being executed so that next proposal executions don’t need to prune from the first proposal ID:
+
+```solidity
+// Gov.sol
+
+function _executeProposal(uint256 proposalID) internal {
+        ...
+
+        // when a proposal is passed, the previous proposals will be invalidated and deleted
+        for (uint256 i = undeletedProposalStart; i < proposalID; i++) {
+            delete proposalData[i];
+            delete proposalInfos[i];
+            delete votes[i];
+        }
+        
+        undeletedProposalStart = proposalID;
+        
+        ...
+}
+```
+
+However, this iteration can lead to an out-of-gas error, as a malicious sequencer can inflate the amount of proposal ID’s due to the lack of limits in proposal creations:
+
+```solidity
+// Gov.sol
+function createProposal(ProposalData calldata proposal) external onlySequencer returns (uint256) {
+        require(proposal.rollupEpoch != 0, "invalid rollup epoch");
+        require(proposal.maxChunks > 0, "invalid max chunks");
+        require(
+            proposal.batchBlockInterval != 0 || proposal.batchMaxBytes != 0 || proposal.batchTimeout != 0,
+            "invalid batch params"
+        );
+
+        currentProposalID++;
+        proposalData[currentProposalID] = proposal;
+        proposalInfos[currentProposalID] = ProposalInfo(block.timestamp + votingDuration, false);
+
+        emit ProposalCreated(
+            currentProposalID,
+            _msgSender(),
+            proposal.batchBlockInterval,
+            proposal.batchMaxBytes,
+            proposal.batchTimeout,
+            proposal.maxChunks,
+            proposal.rollupEpoch
+        );
+
+        return (currentProposalID);
+    }
+```
+
+As shown in the snippet, any sequencer can create a proposal, and there’s no limit to proposal creation, allowing the proposal inflation scenario to occur.
+
+### Internal pre-conditions
+
+- A staker in Morph needs to be a sequencer in the sequencer set (achieved by obtaining delegations, or by simply being added as a staker in the `L2Staking` contract if rewards have not started)
+- The sequencer needs to call `createProposal()` several times so the amount of proposals created is inflated, and the `currentProposalID` tracker becomes a number big enough to DoS proposal pruning
+
+### External pre-conditions
+
+None.
+
+### Attack Path
+
+1. A staker stakes in `L1Staking`. A cross-layer message is sent from L1 to L2, and the staker is registered to the `L2Staking` contract as a staker.
+2. If rewards have not started and the sequencer set is not filled, the staker will be directly added to the sequencer set, becoming a sequencer. Otherwise, the staker needs to have some MORPH tokens delegated so that he can become a sequencer.
+3. After becoming a sequencer, `createProposal()` is called several times to inflate the amount of proposal ID’s. The sequencer can set unreasonable values so that voting and executing any of the proposals leads the system to behave dangerously, making it disappealing for sequencers to vote for any of the proposals and avoid the OOG issue by executing certain proposals.
+4. Because `currentProposalID` has been inflated, any proposal created after the inflation will try to prune all the previous fake proposals, leading to a DoS and runnning out of gas. This will effectively DoS proposal creation.
+
+### Impact
+
+Sequencers won’t be able to execute proposals in the governance contract, making it impossible to update global network parameters used by Morph.
+
+### PoC
+
+_No response_
+
+### Mitigation
+
+Implement a cooldown period between proposal creations. This will prevent creating a huge amount of proposals, as the attacker will need to wait for the cooldown period to finish in order to create another proposal. If the owner identifies suspicious behavior, he can then remove him in the L1 staking contract, and effectively removing the attacker as sequencer in the L2.
+
+# Issue M-11: In the `revertBatch` function, `inChallenge` is set to `false` incorrectly, causing challenges to continue after the protocol is paused. 
 
 Source: https://github.com/sherlock-audit/2024-08-morphl2-judging/issues/220 
 
