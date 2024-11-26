@@ -115,6 +115,16 @@ N/A
 
 Check in `commitBatch()` that `prevStateRoot` is equal to the `parentBatchHeader.postStateRoot`.
 
+
+
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/morph-l2/morph/pull/616
+
+
 # Issue H-3: Sequencer will be underpaid because of incorrect `commitScalar` 
 
 Source: https://github.com/sherlock-audit/2024-08-morphl2-judging/issues/90 
@@ -619,6 +629,8 @@ https://github.com/morph-l2/morph/pull/577
 # Issue M-5: Malicious challenger can brick `finalizeTimestamp` of unfinalized batches 
 
 Source: https://github.com/sherlock-audit/2024-08-morphl2-judging/issues/145 
+
+The protocol has acknowledged this issue.
 
 ## Found by 
 DeltaXV, PASCAL, n4nika, ulas
@@ -1471,6 +1483,16 @@ _No response_
 ### Mitigation
 
 Implement a cooldown period between proposal creations. This will prevent creating a huge amount of proposals, as the attacker will need to wait for the cooldown period to finish in order to create another proposal. If the owner identifies suspicious behavior, he can then remove him in the L1 staking contract, and effectively removing the attacker as sequencer in the L2.
+
+
+
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/morph-l2/morph/pull/603
+
 
 # Issue M-11: In the `revertBatch` function, `inChallenge` is set to `false` incorrectly, causing challenges to continue after the protocol is paused. 
 
